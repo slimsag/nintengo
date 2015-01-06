@@ -30,13 +30,15 @@ func NewAudio(frequency int, sampleSize int) (audio *Azul3DAudio, err error) {
 		return
 	}
 
+	sampleSize = frequency/4
 	audio = &Azul3DAudio{
 		frequency:  frequency,
 		device:     device,
 		sampleSize: sampleSize,
-		buffers:    make([]uint32, 2),
-		input:      make(chan int16),
+		buffers:    make([]uint32, frequency/sampleSize),
+		input:      make(chan int16, sampleSize),
 	}
+	fmt.Println(len(audio.buffers), "buffers")
 
 	al.SetErrorHandler(func(e error) {
 		err = e
@@ -67,26 +69,15 @@ func (audio *Azul3DAudio) Input() chan int16 {
 	return audio.input
 }
 
-func (audio *Azul3DAudio) stream(flush chan bool, schan chan []int16) {
+func (audio *Azul3DAudio) stream(schan chan []int16) {
 	samples := []int16{}
-	doFlush := false
 
 	for {
-		select {
-		case s := <-audio.input:
-			samples = append(samples, s)
-		case <-flush:
-			doFlush = true
-		}
+		samples = append(samples, <-audio.input)
 
-		if doFlush || len(samples) == audio.sampleSize {
-			if len(samples) == 0 {
-				samples = append(samples, <-audio.input)
-			}
-
+		if len(samples) == audio.sampleSize {
 			schan <- samples
 			samples = []int16{}
-			doFlush = false
 		}
 	}
 }
@@ -114,11 +105,10 @@ func (audio *Azul3DAudio) Run() {
 
 	al.SetErrorHandler(handler)
 
-	flush := make(chan bool)
 	schan := make(chan []int16, 256)
-	empty := []int16{0, 0}
+	empty := make([]int16, audio.sampleSize)
 
-	go audio.stream(flush, schan)
+	go audio.stream(schan)
 
 	for i := range audio.buffers {
 		handler(audio.bufferData(audio.buffers[i], empty))
@@ -129,7 +119,6 @@ func (audio *Azul3DAudio) Run() {
 
 	state := al.PLAYING
 	processed := int32(0)
-	samples := []int16{0}
 
 	for running {
 		if audio.device.GetSourcei(audio.source, al.BUFFERS_PROCESSED, &processed); processed > 0 {
@@ -137,29 +126,17 @@ func (audio *Azul3DAudio) Run() {
 
 			audio.device.SourceUnqueueBuffers(audio.source, pbuffers)
 
+			fmt.Println("Processed:", processed)
 			for i := range pbuffers {
-				if samples == nil {
-					select {
-					case samples = <-schan:
-					default:
-						flush <- true
-						samples = <-schan
-					}
-				}
-
-				handler(audio.bufferData(pbuffers[i], samples))
-				samples = nil
+				handler(audio.bufferData(pbuffers[i], <-schan))
 			}
+			fmt.Println("Refilled:", processed)
 
 			audio.device.SourceQueueBuffers(audio.source, pbuffers)
 
 			if audio.device.GetSourcei(audio.source, al.SOURCE_STATE, &state); state != al.PLAYING {
 				audio.device.SourcePlay(audio.source)
 			}
-		}
-
-		if samples == nil {
-			samples = <-schan
 		}
 	}
 }
